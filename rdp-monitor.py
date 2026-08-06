@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shlex
 import socket
 import subprocess
@@ -32,7 +31,6 @@ get_profile_for_ip = profiles.get_profile_for_ip
 get_unknown_profile_name = profiles.get_unknown_profile_name
 
 
-PID_PATTERN = re.compile(r"pid=(\d+)")
 LOOPBACK_IPS = {"127.0.0.1", "::1", "localhost"}
 KEYBOARD_LAYOUT_INDEX = {
     "English (US)": 0,
@@ -123,40 +121,70 @@ def is_loopback(ip_address: str) -> bool:
         return False
 
 
-def extract_pid(line: str) -> str | None:
-    match = PID_PATTERN.search(line)
-    return match.group(1) if match else None
-
-
-def read_process_environment(pid: str) -> dict[str, str]:
-    environ_path = Path("/proc") / pid / "environ"
-    try:
-        raw = environ_path.read_bytes()
-    except OSError:
+def read_loginctl_session_properties(session_id: str) -> dict[str, str]:
+    result = run_command([
+        "loginctl",
+        "show-session",
+        session_id,
+        "-p",
+        "Service",
+        "-p",
+        "Remote",
+        "-p",
+        "RemoteHost",
+        "-p",
+        "State",
+    ])
+    if result.returncode != 0:
         return {}
 
-    environment: dict[str, str] = {}
-    for entry in raw.split(b"\0"):
-        if b"=" not in entry:
+    properties: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
             continue
-        key, value = entry.split(b"=", 1)
-        environment[key.decode(errors="ignore")] = value.decode(
-            errors="ignore")
-    return environment
+        key, value = line.split("=", 1)
+        properties[key.strip()] = value.strip()
+    return properties
 
 
-def resolve_ssh_origin_ip(pid: str, fallback_ip: str) -> str:
-    environment = read_process_environment(pid)
-    for variable in ("SSH_CONNECTION", "SSH_CLIENT"):
-        value = environment.get(variable)
-        if not value:
+def find_ssh_remote_host() -> str | None:
+    result = run_command(["loginctl", "list-sessions", "--no-legend"])
+    if result.returncode != 0:
+        return None
+
+    active_hosts: list[str] = []
+    fallback_hosts: list[str] = []
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 1:
             continue
 
-        candidate = normalize_ip(value.split()[0])
-        if candidate and not is_loopback(candidate):
-            return candidate
+        session_id = parts[0]
+        properties = read_loginctl_session_properties(session_id)
+        if properties.get("Service") != "sshd":
+            continue
+        if properties.get("Remote", "no") != "yes":
+            continue
 
-    return fallback_ip
+        remote_host = normalize_ip(properties.get("RemoteHost", ""))
+        if not remote_host or is_loopback(remote_host):
+            continue
+
+        if properties.get("State") == "active":
+            active_hosts.append(remote_host)
+        else:
+            fallback_hosts.append(remote_host)
+
+    unique_active_hosts = list(dict.fromkeys(active_hosts))
+    if len(unique_active_hosts) == 1:
+        return unique_active_hosts[0]
+
+    unique_fallback_hosts = list(dict.fromkeys(fallback_hosts))
+    if len(unique_fallback_hosts) == 1:
+        return unique_fallback_hosts[0]
+
+    return None
 
 
 def detect_rdp_server_port() -> int:
@@ -180,9 +208,6 @@ def detect_rdp_server_port() -> int:
 def detect_connection(rdp_port: int) -> ConnectionInfo | None:
     direct_connection: ConnectionInfo | None = None
     loopback_connection: ConnectionInfo | None = None
-    ssh_remote_by_pid: dict[str, str] = {}
-    ssh_tunnel_pid_by_port: dict[int, str] = {}
-    unique_ssh_remote_ips: set[str] = set()
 
     for line in run_ss(["-Htnp", "state", "established"]):
         parts = line.split()
@@ -193,7 +218,6 @@ def detect_connection(rdp_port: int) -> ConnectionInfo | None:
         local_endpoint, peer_endpoint = endpoints
         _, local_port = parse_endpoint(local_endpoint)
         peer_ip, peer_port = parse_endpoint(peer_endpoint)
-        pid = extract_pid(line)
 
         if local_port == rdp_port and peer_port is not None:
             candidate = ConnectionInfo(
@@ -208,32 +232,16 @@ def detect_connection(rdp_port: int) -> ConnectionInfo | None:
             else:
                 direct_connection = candidate
 
-        if pid and local_port == 22 and peer_ip and not is_loopback(peer_ip):
-            resolved_peer_ip = resolve_ssh_origin_ip(pid, peer_ip)
-            ssh_remote_by_pid[pid] = resolved_peer_ip
-            unique_ssh_remote_ips.add(resolved_peer_ip)
-
-        if pid and local_port is not None and local_port not in {22} and peer_port == rdp_port:
-            ssh_tunnel_pid_by_port[local_port] = pid
-
     if direct_connection is not None:
         return direct_connection
 
     if loopback_connection is None:
         return None
 
-    tunnel_pid = ssh_tunnel_pid_by_port.get(loopback_connection.peer_port)
-    if tunnel_pid and tunnel_pid in ssh_remote_by_pid:
+    ssh_remote_host = find_ssh_remote_host()
+    if ssh_remote_host is not None:
         return ConnectionInfo(
-            client_ip=ssh_remote_by_pid[tunnel_pid],
-            connection_type="ssh_tunnel",
-            rdp_port=rdp_port,
-            peer_port=loopback_connection.peer_port,
-        )
-
-    if len(unique_ssh_remote_ips) == 1:
-        return ConnectionInfo(
-            client_ip=next(iter(unique_ssh_remote_ips)),
+            client_ip=ssh_remote_host,
             connection_type="ssh_tunnel",
             rdp_port=rdp_port,
             peer_port=loopback_connection.peer_port,

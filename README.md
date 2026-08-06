@@ -52,7 +52,7 @@ Python note:
 `rdp-monitor.py` polls the local RDP server port and active TCP sessions.
 
 - Direct RDP connections are matched from the peer IP.
-- SSH-tunneled connections try to recover the original client IP from the SSH process environment (`SSH_CONNECTION` or `SSH_CLIENT`).
+- SSH-tunneled connections resolve the active SSH session's `RemoteHost` so loopback RDP sessions can still map to the originating public IP.
 - If no specific mapping matches, the fallback rule in `profiles.json` is used.
 
 When a profile is selected, the monitor:
