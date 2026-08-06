@@ -1,0 +1,36 @@
+conky.config = {
+    alignment = 'top_right',
+    gap_x = 20,
+    gap_y = 40,
+
+    own_window = true,
+    own_window_type = 'dock',   -- best for Plasma Wayland
+    own_window_transparent = true,
+    own_window_hints = 'undecorated,below,sticky,skip_taskbar,skip_pager',
+
+    double_buffer = true,
+    update_interval = 1,
+
+    minimum_width = 300,
+    maximum_width = 300,
+
+    draw_shades = false,
+    draw_outline = false,
+    draw_borders = false,
+
+    use_xft = true,
+    font = 'DejaVu Sans Mono:size=10',
+
+    default_color = 'white',
+
+    alignment = 'top_right',
+
+    no_buffers = true,
+    uppercase = false,
+
+    lua_load = '',
+};
+
+conky.text = [[
+${execi 1 ~/.config/rdp/render.sh}
+]];
