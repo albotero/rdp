@@ -173,36 +173,30 @@ If your local file is not marked executable, invoke it the same way the user ser
 ~/.config/rdp/.venv/bin/python ~/.config/rdp/rdp-monitor.py restart-server
 ```
 
-## Stale Session Watchdog
+## Disconnect Cleanup Watchdog
 
-KRDP can sometimes keep a disconnected session alive. When that happens, the monitor may keep seeing the old session instead of applying the next client profile.
-
-To mitigate that, `rdp-monitor.py` includes a stale-session watchdog.
-
-If the same RDP socket stays idle long enough, the monitor restarts:
-
-- `app-org.kde.krdpserver.service`
+To clear lingering KRDP tray sessions after a client disconnect, the monitor also restarts KRDP when there is no active RDP session for a short time.
 
 Default timeout:
 
-- `120` seconds
+- `20` seconds
 
 Override it on the command line:
 
 ```bash
-python3 ~/.config/rdp/rdp-monitor.py --stale-seconds 90
+python3 ~/.config/rdp/rdp-monitor.py --disconnect-restart-seconds 30
 ```
 
 Or with an environment variable:
 
 ```bash
-export KRDP_STALE_SECONDS=90
+export KRDP_DISCONNECT_RESTART_SECONDS=30
 ```
 
-Disable the watchdog completely:
+Disable this cleanup behavior:
 
 ```bash
-python3 ~/.config/rdp/rdp-monitor.py --stale-seconds 0
+python3 ~/.config/rdp/rdp-monitor.py --disconnect-restart-seconds 0
 ```
 
 ## Service Installation
@@ -219,6 +213,7 @@ What the installer does:
 - writes `~/.config/systemd/user/rdp-profile.service`
 - reloads the user systemd daemon
 - enables and starts the service
+- removes the legacy logout cleanup unit if it exists from older installs
 
 The service runs:
 
@@ -293,7 +288,7 @@ These files are deleted automatically when no active RDP session is detected.
 
 ### Stale session is not dropped
 
-- Lower `--stale-seconds` or `KRDP_STALE_SECONDS`.
+- Lower `--disconnect-restart-seconds` or `KRDP_DISCONNECT_RESTART_SECONDS`.
 - Inspect KRDP with `systemctl --user status app-org.kde.krdpserver.service`.
 - Check monitor logs with `journalctl --user-unit rdp-profile.service -f`.
 
@@ -312,11 +307,11 @@ Expected result:
 - The monitor prints `[RDP] Restarted app-org.kde.krdpserver.service`.
 - The second MainPID value differs from the first.
 
-To check whether automatic stale-session restarts were triggered:
+To check whether disconnect cleanup restarts were triggered:
 
 ```bash
 journalctl --user -u rdp-profile.service --since "24 hours ago" --no-pager \
-  | grep -E "Dropping stale KRDP session|Restarted app-org.kde.krdpserver.service|Failed to restart app-org.kde.krdpserver.service"
+  | grep -E "No active RDP session for .* restarting app-org.kde.krdpserver.service"
 ```
 
 ## Notes

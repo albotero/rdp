@@ -23,8 +23,8 @@ CONFIG_DIR = Path(__file__).resolve().parent
 STATE_JSON_PATH = CONFIG_DIR / "state.json"
 STATE_ENV_PATH = CONFIG_DIR / "state.env"
 DEFAULT_RDP_PORT = int(os.environ.get("RDP_SERVER_PORT", "3389"))
-DEFAULT_STALE_SECONDS = max(
-    int(os.environ.get("KRDP_STALE_SECONDS", "120")), 0)
+DEFAULT_DISCONNECT_RESTART_SECONDS = max(
+    int(os.environ.get("KRDP_DISCONNECT_RESTART_SECONDS", "20")), 0)
 KRDP_USER_UNIT = "app-org.kde.krdpserver.service"
 
 
@@ -47,15 +47,6 @@ class ConnectionInfo:
     connection_type: str
     rdp_port: int
     peer_port: int
-
-
-@dataclass(frozen=True)
-class ConnectionActivity:
-    peer_port: int
-    bytes_sent: int
-    bytes_received: int
-    last_send_ms: int
-    last_recv_ms: int
 
 
 @dataclass(frozen=True)
@@ -85,30 +76,6 @@ def run_ss(arguments: list[str]) -> list[str]:
     if result.returncode != 0:
         return []
     return [line for line in result.stdout.splitlines() if line.strip()]
-
-
-def run_ss_blocks(arguments: list[str]) -> list[list[str]]:
-    result = run_command(["ss", *arguments])
-    if result.returncode != 0:
-        return []
-
-    blocks: list[list[str]] = []
-    current: list[str] = []
-    for line in result.stdout.splitlines():
-        if not line.strip():
-            continue
-        if line[0].isspace():
-            if current:
-                current.append(line.strip())
-            continue
-        if current:
-            blocks.append(current)
-        current = [line.strip()]
-
-    if current:
-        blocks.append(current)
-
-    return blocks
 
 
 def normalize_ip(value: str) -> str:
@@ -275,72 +242,61 @@ def detect_connection(rdp_port: int) -> ConnectionInfo | None:
     return loopback_connection
 
 
-def parse_stat_value(stats_line: str, key: str) -> int | None:
-    match = re.search(rf"\b{re.escape(key)}:(\d+)", stats_line)
-    if match is None:
+def get_unit_main_pid(unit_name: str) -> int | None:
+    result = run_command(["systemctl", "--user", "show",
+                         "-p", "MainPID", "--value", unit_name])
+    if result.returncode != 0:
         return None
-    return int(match.group(1))
 
+    value = (result.stdout or "").strip()
+    if not value.isdigit():
+        return None
 
-def detect_connection_activity(
-    rdp_port: int,
-    connection: ConnectionInfo,
-) -> ConnectionActivity | None:
-    for block in run_ss_blocks(["-tinp", "state", "established"]):
-        parts = block[0].split()
-        endpoints = get_socket_endpoints(parts)
-        if endpoints is None:
-            continue
-
-        local_endpoint, peer_endpoint = endpoints
-        _, local_port = parse_endpoint(local_endpoint)
-        _, peer_port = parse_endpoint(peer_endpoint)
-        if local_port != rdp_port or peer_port != connection.peer_port:
-            continue
-
-        stats_line = " ".join(block[1:]) if len(block) > 1 else ""
-        bytes_sent = parse_stat_value(stats_line, "bytes_sent")
-        bytes_received = parse_stat_value(stats_line, "bytes_received")
-        last_send_ms = parse_stat_value(stats_line, "lastsnd")
-        last_recv_ms = parse_stat_value(stats_line, "lastrcv")
-        if any(v is None for v in {bytes_sent, bytes_received, last_send_ms, last_recv_ms}):
-            return None
-
-        return ConnectionActivity(
-            peer_port=connection.peer_port,
-            bytes_sent=bytes_sent,  # type: ignore
-            bytes_received=bytes_received,  # type: ignore
-            last_send_ms=last_send_ms,  # type: ignore
-            last_recv_ms=last_recv_ms,  # type: ignore
-        )
-
-    return None
-
-
-def is_same_activity(current: ConnectionActivity, previous: ConnectionActivity | None) -> bool:
-    if previous is None:
-        return False
-    return (
-        current.peer_port == previous.peer_port
-        and current.bytes_sent == previous.bytes_sent
-        and current.bytes_received == previous.bytes_received
-    )
-
-
-def is_activity_stale(activity: ConnectionActivity, stale_seconds: int) -> bool:
-    stale_ms = stale_seconds * 1000
-    return activity.last_send_ms >= stale_ms and activity.last_recv_ms >= stale_ms
+    pid = int(value)
+    if pid <= 0:
+        return None
+    return pid
 
 
 def restart_krdp_service() -> bool:
+    before_pid = get_unit_main_pid(KRDP_USER_UNIT)
     result = run_command(["systemctl", "--user", "restart", KRDP_USER_UNIT])
-    if result.returncode == 0:
-        log(f"Restarted {KRDP_USER_UNIT}")
+    if result.returncode != 0:
+        details = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        log(f"Failed to restart {KRDP_USER_UNIT}: {details}")
+        return False
+
+    after_pid = get_unit_main_pid(KRDP_USER_UNIT)
+    if before_pid is not None and after_pid == before_pid:
+        log(
+            f"Restart kept same KRDP PID {after_pid}; forcing stop/start for a clean session reset"
+        )
+        stop_result = run_command(
+            ["systemctl", "--user", "stop", KRDP_USER_UNIT])
+        if stop_result.returncode != 0:
+            details = stop_result.stderr.strip() or stop_result.stdout.strip() or "unknown error"
+            log(f"Failed to stop {KRDP_USER_UNIT}: {details}")
+            return False
+
+        start_result = run_command(
+            ["systemctl", "--user", "start", KRDP_USER_UNIT])
+        if start_result.returncode != 0:
+            details = start_result.stderr.strip() or start_result.stdout.strip() or "unknown error"
+            log(f"Failed to start {KRDP_USER_UNIT}: {details}")
+            return False
+
+        final_pid = get_unit_main_pid(KRDP_USER_UNIT)
+        if final_pid is not None:
+            log(f"Force-restarted {KRDP_USER_UNIT} (PID {before_pid} -> {final_pid})")
+        else:
+            log(f"Force-restarted {KRDP_USER_UNIT}")
         return True
 
-    details = result.stderr.strip() or result.stdout.strip() or "unknown error"
-    log(f"Failed to restart {KRDP_USER_UNIT}: {details}")
-    return False
+    if before_pid is not None and after_pid is not None:
+        log(f"Restarted {KRDP_USER_UNIT} (PID {before_pid} -> {after_pid})")
+    else:
+        log(f"Restarted {KRDP_USER_UNIT}")
+    return True
 
 
 def build_test_connection(client_ip: str, source: str, rdp_port: int) -> ConnectionInfo:
@@ -484,9 +440,10 @@ def monitor(
     test_client_ip: str | None,
     test_source: str,
     test_rdp_port: int | None,
-    stale_seconds: int,
+    disconnect_restart_seconds: int,
 ) -> int:
-    previous_activity: ConnectionActivity | None = None
+    disconnected_since: float | None = None
+    disconnect_restart_done = False
     try:
         while True:
             if test_client_ip is not None:
@@ -499,8 +456,25 @@ def monitor(
                 connection = detect_connection(rdp_port)
 
             if connection is None:
-                previous_activity = None
                 clear_state()
+                if disconnected_since is None:
+                    disconnected_since = time.time()
+                    disconnect_restart_done = False
+
+                if (
+                    not once
+                    and test_client_ip is None
+                    and disconnect_restart_seconds > 0
+                    and not disconnect_restart_done
+                    and disconnected_since is not None
+                    and (time.time() - disconnected_since) >= disconnect_restart_seconds
+                ):
+                    log(
+                        f"No active RDP session for {disconnect_restart_seconds}s; restarting {KRDP_USER_UNIT}"
+                    )
+                    restart_krdp_service()
+                    disconnect_restart_done = True
+
                 if once:
                     log("No active RDP session detected")
                 if once:
@@ -508,25 +482,8 @@ def monitor(
                 time.sleep(interval)
                 continue
 
-            activity = detect_connection_activity(rdp_port, connection)
-            if (
-                stale_seconds > 0
-                and activity is not None
-                and is_same_activity(activity, previous_activity)
-                and is_activity_stale(activity, stale_seconds)
-            ):
-                log(
-                    f"Dropping stale KRDP session for port {connection.peer_port} after {stale_seconds}s idle"
-                )
-                restart_krdp_service()
-                previous_activity = None
-                clear_state()
-                if once:
-                    return 0
-                time.sleep(interval)
-                continue
-
-            previous_activity = activity
+            disconnected_since = None
+            disconnect_restart_done = False
 
             next_state = build_state(connection)
             previous_state = load_state()
@@ -566,10 +523,10 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--rdp-port", type=int,
                         help="Override the detected RDP port in test mode.")
     parser.add_argument(
-        "--stale-seconds",
+        "--disconnect-restart-seconds",
         type=int,
-        default=DEFAULT_STALE_SECONDS,
-        help="Restart KRDP when the same RDP socket is idle for this many seconds. Use 0 to disable.",
+        default=DEFAULT_DISCONNECT_RESTART_SECONDS,
+        help="Restart KRDP after this many seconds with no active RDP session. Use 0 to disable.",
     )
     return parser.parse_args(list(argv))
 
@@ -591,7 +548,7 @@ def main(argv: Iterable[str]) -> int:
         test_client_ip=args.client_ip,
         test_source=args.source,
         test_rdp_port=args.rdp_port,
-        stale_seconds=max(args.stale_seconds, 0),
+        disconnect_restart_seconds=max(args.disconnect_restart_seconds, 0),
     )
 
 
