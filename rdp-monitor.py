@@ -393,6 +393,9 @@ def apply_keyboard(layout_name: str) -> None:
     if layout_index is None:
         return
 
+    if find_wayland_display() is None:
+        load_x11_layouts()
+
     result = run_command(
         [
             "busctl",
@@ -410,9 +413,56 @@ def apply_keyboard(layout_name: str) -> None:
         log(f"Keyboard update failed: {result.stderr.strip() or result.stdout.strip()}")
 
 
+def find_x11_display() -> str | None:
+    if os.environ.get("DISPLAY"):
+        return os.environ["DISPLAY"]
+    for socket_path in sorted(Path("/tmp/.X11-unix").glob("X[0-9]*")):
+        if socket_path.stat().st_uid == os.getuid():
+            return f":{socket_path.name[1:]}"
+    return None
+
+
+def load_x11_layouts() -> None:
+    # xrdp loads only the client's layout, so KDE's group index would wrap back to "us".
+    display = find_x11_display()
+    if display is None:
+        return
+    layouts = ",".join(
+        kb.key for kb in sorted(profiles.KEYBOARDS.values(), key=lambda kb: kb.index))
+    result = subprocess.run(
+        ["setxkbmap", "-model", "pc105", "-layout", layouts],
+        check=False, text=True, capture_output=True,
+        env={**os.environ, "DISPLAY": display})
+    if result.returncode != 0:
+        log(f"setxkbmap failed: {result.stderr.strip() or result.stdout.strip()}")
+
+
+def find_wayland_display() -> str | None:
+    runtime_dir = Path(os.environ.get(
+        "XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    for socket_path in sorted(runtime_dir.glob("wayland-[0-9]*")):
+        if socket_path.is_socket():
+            return socket_path.name
+    return None
+
+
 def apply_display(resolution: str) -> None:
-    result = run_command(
-        ["kscreen-doctor", f"output.Virtual-1.mode.{resolution}"])
+    wayland_display = find_wayland_display()
+    if wayland_display is None:
+        # No Plasma Wayland session (e.g. xrdp X11): the client sets resolution itself.
+        log("Skipping display update: no Wayland session for kscreen-doctor")
+        return
+
+    # KRDP/KScreen may report the session before the virtual output is
+    # fully initialized. Give KScreen a moment before changing the mode.
+    time.sleep(3)
+
+    env = {**os.environ, "WAYLAND_DISPLAY": wayland_display,
+           "QT_QPA_PLATFORM": "wayland"}
+    env.pop("DISPLAY", None)
+    result = subprocess.run(
+        ["kscreen-doctor", f"output.Virtual-1.mode.{resolution}"],
+        check=False, text=True, capture_output=True, env=env)
     if result.returncode != 0:
         log(f"Display update failed: {result.stderr.strip() or result.stdout.strip()}")
 
@@ -438,6 +488,8 @@ def states_match(current: State | None, previous: State | None) -> bool:
         and current.client_ip == previous.client_ip
         and current.client_source == previous.client_source
         and current.rdp_port == previous.rdp_port
+        and current.keyboard == previous.keyboard
+        and current.resolution == previous.resolution
     )
 
 
@@ -554,7 +606,8 @@ def main(argv: Iterable[str]) -> int:
         dry_run=args.dry_run,
         interval=max(args.interval, 0.2),
         test_client_ip=args.client_ip,
-        test_source=args.source,
+        test_source=args.test_source if hasattr(
+            args, "test_source") else args.source,
         test_rdp_port=args.rdp_port,
         disconnect_restart_seconds=max(args.disconnect_restart_seconds, 0),
     )
